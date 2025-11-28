@@ -1,2 +1,7 @@
-const bcrypt = require("bcrypt");
-bcrypt.hash("senedjiguiya2026", 10).then(console.log);
+import bcrypt from "bcrypt";
+
+const password = "jnt2026";
+const hash = await bcrypt.hash(password, 10);
+
+console.log("Hash:", hash);
+
