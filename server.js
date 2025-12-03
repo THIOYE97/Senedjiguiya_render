@@ -1,3 +1,5 @@
+console.log("🔥 Version du serveur chargée:", Date.now());
+
 import express from "express";
 import dotenv from "dotenv";
 import pkg from "pg";
