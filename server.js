@@ -4,6 +4,7 @@ import pkg from "pg";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cors from "cors";
+import { parse } from "pg-connection-string"; // <== IMPORTANT
 
 // === Gestion globale des erreurs non gérées ===
 process.on("unhandledRejection", (err) => {
@@ -21,17 +22,29 @@ const app = express();
 app.use(express.json());
 app.use(cors({ origin: "*" }));
 
-// === DB avec reconnexion automatique ===
+// ================================================
+// 🚨 FIX RENDER : empêcher PGHOST/PGPORT de casser Supabase
+// ================================================
+
+const parsed = parse(process.env.DATABASE_URL);
+
 const db = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  host: parsed.host,
+  port: parsed.port,
+  user: parsed.user,
+  password: parsed.password,
+  database: parsed.database,
   ssl: { rejectUnauthorized: false },
-  max: 10, // limite de connexions simultanées
-  idleTimeoutMillis: 30000, // déconnexion après 30s d'inactivité
-  connectionTimeoutMillis: 5000, // timeout connexion initiale
-  keepAlive: true, // maintient la connexion TCP active
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 5000,
+  keepAlive: true,
 });
 
-// Fonction de test/reconnexion
+// ================================================
+// 🔄 TEST + RECONNEXION AUTO
+// ================================================
+
 async function testDBConnection() {
   try {
     const client = await db.connect();
@@ -44,17 +57,18 @@ async function testDBConnection() {
   }
 }
 
-// Démarre le test initial
 testDBConnection();
 
-// Gestion d'erreurs asynchrones du pool
+// Gestion d'erreurs asynchrones
 db.on("error", (err) => {
   console.error("🚨 Erreur inattendue du pool PostgreSQL:", err.message);
   console.log("🔁 Tentative de reconnexion automatique...");
   setTimeout(testDBConnection, 5000);
 });
 
-// Ping périodique pour éviter l'idle timeout Supabase (toutes les 4 minutes)
+// ================================================
+// 💓 Ping DB (garde la connexion vivante)
+// ================================================
 setInterval(async () => {
   try {
     await db.query("SELECT 1");
@@ -64,8 +78,9 @@ setInterval(async () => {
   }
 }, 4 * 60 * 1000);
 
-// ✅ Export de la connexion DB pour réutilisation
+
 export { db };
+
 
 // === AUTHENTIFICATION ===
 function authenticateToken(req, res, next) {
