@@ -29,6 +29,9 @@ app.use(cors({ origin: "*" }));
 // ================================================
 
 const parsed = parse(process.env.DATABASE_URL);
+console.log("🔍 DATABASE_URL brut =", process.env.DATABASE_URL);
+console.log("🔍 Host final utilisé =", parsed.host);
+console.log("🔍 Port final utilisé =", parsed.port);
 
 const db = new Pool({
   host: parsed.host,
@@ -299,71 +302,116 @@ app.get("/ve/:id", authenticateToken, async (req, res) => {
 });
 // === AJOUTER UN CLIENT ===
 app.post("/clients", authenticateToken, async (req, res) => {
+  const client = await db.connect();
   try {
     const { ve_id, nom, prenom, telephone, montant, numero_recu, paquet_id } = req.body;
 
-    // Vérifications des champs obligatoires
     if (!ve_id || !nom || !prenom || !telephone)
       return res.status(400).json({ message: "Champs manquants" });
 
-    // Vérification VE (si l'utilisateur n'est pas admin)
+    // Vérification VE
     if (req.user.role !== "ADMIN") {
-      const checkVe = await db.query("SELECT id FROM ve WHERE user_id = $1", [req.user.id]);
+      const checkVe = await client.query(
+        "SELECT id FROM ve WHERE user_id = $1",
+        [req.user.id]
+      );
       if (checkVe.rows.length === 0 || checkVe.rows[0].id !== Number(ve_id))
         return res.status(403).json({ message: "Accès interdit" });
     }
 
-    // Récupération du village du VE
-    const veRes = await db.query("SELECT village_id FROM ve WHERE id = $1", [ve_id]);
+    // Village du VE
+    const veRes = await client.query(
+      "SELECT village_id FROM ve WHERE id = $1",
+      [ve_id]
+    );
     if (veRes.rows.length === 0)
       return res.status(400).json({ message: "VE introuvable" });
 
     const village_id = veRes.rows[0].village_id;
-    const client_code = `CL-${ve_id}-${Date.now()}`;
 
-    // ✅ Création du client (avec paquet_id inclus)
-    const insert = await db.query(
-      `INSERT INTO clients (client_code, nom, prenom, ve_id, village_id, date_inscription, telephone, paquet_id)
-       VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
-       RETURNING id`,
+    await client.query("BEGIN");
+
+    // 🔒 1. Vérification doublon CLIENT
+    const clientCheck = await client.query(
+      `
+      SELECT id FROM clients
+      WHERE nom = $1
+        AND prenom = $2
+        AND telephone = $3
+        AND village_id = $4
+      LIMIT 1
+      `,
+      [nom, prenom, telephone, village_id]
+    );
+
+    if (clientCheck.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({
+        message: "Ce client existe déjà dans ce village."
+      });
+    }
+
+    // 🔒 2. Vérification reçu AVANT insertion
+    if (montant && Number(montant) > 0) {
+      if (!numero_recu || numero_recu.trim() === "") {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          message: "Le numéro de reçu est obligatoire."
+        });
+      }
+
+      const recuCheck = await client.query(
+        "SELECT id FROM paiements WHERE numero_recu = $1",
+        [numero_recu.trim()]
+      );
+
+      if (recuCheck.rows.length > 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({
+          message: "Ce numéro de reçu existe déjà."
+        });
+      }
+    }
+
+    // ✅ 3. Insertion client
+    const client_code = `CL-${ve_id}-${Date.now()}`;
+    const insertClient = await client.query(
+      `
+      INSERT INTO clients
+      (client_code, nom, prenom, ve_id, village_id, date_inscription, telephone, paquet_id)
+      VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7)
+      RETURNING id
+      `,
       [client_code, nom, prenom, ve_id, village_id, telephone, paquet_id || null]
     );
 
-    const client_id = insert.rows[0].id;
+    const client_id = insertClient.rows[0].id;
 
-    // 🧾 Si un montant est saisi, le numéro de reçu devient obligatoire
+    // 💰 4. Paiement initial
     if (montant && Number(montant) > 0) {
-      if (!numero_recu || numero_recu.trim() === "") {
-        return res.status(400).json({
-          message: "Le numéro de reçu est obligatoire pour un paiement initial."
-        });
-      }
-
-      // Vérifie unicité du numéro de reçu + montant
-      const recuCheck = await db.query(
-        "SELECT id FROM paiements WHERE numero_recu = $1 AND montant = $2",
-        [numero_recu.trim(), montant]
-      );
-      if (recuCheck.rows.length > 0) {
-        return res.status(400).json({
-          message: "Ce numéro de reçu existe déjà pour ce montant."
-        });
-      }
-
-      // 💰 Enregistrement du paiement initial
-      await db.query(
-        `INSERT INTO paiements (client_id, montant, date_paiement, user_id, numero_recu)
-         VALUES ($1, $2, NOW(), $3, $4)`,
+      await client.query(
+        `
+        INSERT INTO paiements
+        (client_id, montant, date_paiement, user_id, numero_recu)
+        VALUES ($1,$2,NOW(),$3,$4)
+        `,
         [client_id, montant, req.user.id, numero_recu.trim()]
       );
     }
 
-    res.json({ message: "✅ Client créé avec succès", client_id });
+    await client.query("COMMIT");
+
+    res.json({ message: "Client créé avec succès", client_id });
+
   } catch (err) {
+    await client.query("ROLLBACK");
     console.error("Erreur POST /clients:", err);
     res.status(500).json({ message: "Erreur serveur" });
+  } finally {
+    client.release();
   }
 });
+
 
 // === CLIENTS D’UN VE OU D’UN VILLAGE ===
 app.get("/clients/ve/:ve_id", authenticateToken, async (req, res) => {
