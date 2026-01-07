@@ -1,3 +1,4 @@
+
 console.log("🔥 Version du serveur chargée:", Date.now());
 
 import express from "express";
@@ -6,16 +7,12 @@ import pkg from "pg";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import cors from "cors";
-import { parse } from "pg-connection-string"; // <== IMPORTANT
+import { parse } from "pg-connection-string";
+import crypto from "crypto";
 
 // === Gestion globale des erreurs non gérées ===
-process.on("unhandledRejection", (err) => {
-  console.error("🚨 Promise non gérée:", err);
-});
-
-process.on("uncaughtException", (err) => {
-  console.error("💥 Erreur fatale:", err);
-});
+process.on("unhandledRejection", (err) => console.error("🚨 Promise non gérée:", err));
+process.on("uncaughtException", (err) => console.error("💥 Erreur fatale:", err));
 
 dotenv.config();
 const { Pool } = pkg;
@@ -46,6 +43,8 @@ const db = new Pool({
   keepAlive: true,
 });
 
+export { db };
+
 // ================================================
 // 🔄 TEST + RECONNEXION AUTO
 // ================================================
@@ -61,10 +60,8 @@ async function testDBConnection() {
     setTimeout(testDBConnection, 5000);
   }
 }
-
 testDBConnection();
 
-// Gestion d'erreurs asynchrones
 db.on("error", (err) => {
   console.error("🚨 Erreur inattendue du pool PostgreSQL:", err.message);
   console.log("🔁 Tentative de reconnexion automatique...");
@@ -83,11 +80,8 @@ setInterval(async () => {
   }
 }, 4 * 60 * 1000);
 
+// ==================== AUTH ====================
 
-export { db };
-
-
-// === AUTHENTIFICATION ===
 function authenticateToken(req, res, next) {
   const authHeader = req.headers["authorization"];
   const token = authHeader && authHeader.split(" ")[1];
@@ -100,10 +94,11 @@ function authenticateToken(req, res, next) {
   });
 }
 
-// === PERMISSIONS ===
+// ==================== PERMISSIONS ====================
+
 async function hasPermission(role, permissionName) {
   const result = await db.query(
-    `SELECT p.name 
+    `SELECT p.name
      FROM roles r
      JOIN roles_permissions rp ON r.id = rp.role_id
      JOIN permissions p ON p.id = rp.permission_id
@@ -121,26 +116,107 @@ function requirePermission(permissionName) {
   };
 }
 
-// === REGISTER ===
-app.post("/register", authenticateToken, requirePermission("manage_users"), async (req, res) => {
-  const { username, password, role } = req.body;
-  if (!username || !password || !role)
-    return res.status(400).json({ message: "Champs manquants" });
+// ==================== IDEMPOTENCY ====================
+
+function stableStringify(obj) {
+  if (obj === null || obj === undefined) return "null";
+  if (typeof obj !== "object") return JSON.stringify(obj);
+  if (Array.isArray(obj)) return `[${obj.map(stableStringify).join(",")}]`;
+  return `{${Object.keys(obj)
+    .sort()
+    .map((k) => `"${k}":${stableStringify(obj[k])}`)
+    .join(",")}}`;
+}
+
+function hashRequestBody(body) {
+  const s = stableStringify(body);
+  return crypto.createHash("sha256").update(s).digest("hex");
+}
+
+async function withIdempotency(req, res, routeName, handler) {
+  const key = req.header("X-Idempotency-Key");
+  if (!key) return handler();
+
+  const userId = req.user?.id || 0;
+  const requestHash = hashRequestBody(req.body);
 
   try {
-    const hashedPassword = await bcrypt.hash(password, 10);
-    await db.query(
-      "INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)",
-      [username, hashedPassword, role]
+    const existing = await db.query(
+      `SELECT response_code, response_body, request_hash
+       FROM idempotency_keys
+       WHERE key = $1 AND user_id = $2 AND route = $3
+       LIMIT 1`,
+      [key, userId, routeName]
     );
-    res.json({ message: "Utilisateur créé avec succès" });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Erreur serveur" });
-  }
-});
 
-// === LOGIN ===
+    if (existing.rows.length > 0) {
+      const row = existing.rows[0];
+      if (row.request_hash !== requestHash) {
+        return res.status(409).json({
+          message: "Idempotency key réutilisée avec un contenu différent.",
+        });
+      }
+      return res.status(row.response_code).json(row.response_body);
+    }
+
+    let capturedStatus = 200;
+    const originalStatus = res.status.bind(res);
+    const originalJson = res.json.bind(res);
+
+    res.status = (code) => {
+      capturedStatus = code;
+      return originalStatus(code);
+    };
+
+    res.json = async (body) => {
+      try {
+        await db.query(
+          `INSERT INTO idempotency_keys
+           (key, user_id, route, request_hash, response_code, response_body)
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [key, userId, routeName, requestHash, capturedStatus, JSON.stringify(body)]
+        );
+      } catch (e) {
+        console.warn("Idempotency insert warning:", e.message);
+      }
+      return originalJson(body);
+    };
+
+    return handler();
+  } catch (e) {
+    console.warn("Idempotency check warning:", e.message);
+    // En cas de souci sur la table idempotency_keys, on ne bloque pas la prod
+    return handler();
+  }
+}
+
+// ==================== REGISTER ====================
+
+app.post(
+  "/register",
+  authenticateToken,
+  requirePermission("manage_users"),
+  async (req, res) => {
+    const { username, password, role } = req.body;
+    if (!username || !password || !role)
+      return res.status(400).json({ message: "Champs manquants" });
+
+    try {
+      const hashedPassword = await bcrypt.hash(password, 10);
+      await db.query(
+        "INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3)",
+        [username, hashedPassword, role]
+      );
+      res.json({ message: "Utilisateur créé avec succès" });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: "Erreur serveur" });
+    }
+  }
+);
+
+// ==================== LOGIN ====================
+
 app.post("/login", async (req, res) => {
   const { username, password } = req.body;
   try {
@@ -152,7 +228,6 @@ app.post("/login", async (req, res) => {
     const match = await bcrypt.compare(password, user.password_hash);
     if (!match) return res.status(400).json({ message: "Mot de passe incorrect" });
 
-    // Chercher ve_id et village_id
     let ve_id = null;
     let village_id = null;
 
@@ -183,7 +258,8 @@ app.post("/login", async (req, res) => {
   }
 });
 
-// === ME ===
+// ==================== ME ====================
+
 app.get("/me", authenticateToken, async (req, res) => {
   try {
     const result = await db.query(
@@ -199,7 +275,8 @@ app.get("/me", authenticateToken, async (req, res) => {
   }
 });
 
-// === VE ===
+// ==================== VE ====================
+
 app.get("/ve", authenticateToken, async (req, res) => {
   try {
     let result;
@@ -207,44 +284,40 @@ app.get("/ve", authenticateToken, async (req, res) => {
     if (req.user.role === "ADMIN") {
       result = await db.query(`
        SELECT 
-  ve.id,
-  ve.ve_code,
-  ve.nom,
-  ve.prenom,
-  vil.nom_village,
-  u.username AS user_account,
-  COALESCE(c_count.nb_inscrits, 0) AS nb_inscrits,
-  COALESCE(p_sum.total_paiements, 0) AS total_paiements,
-  COALESCE(paq_sum.total_valeur_paquets, 0) AS total_valeur_paquets
-FROM ve
-LEFT JOIN villages vil ON ve.village_id = vil.id
-LEFT JOIN users u ON ve.user_id = u.id
+          ve.id,
+          ve.ve_code,
+          ve.nom,
+          ve.prenom,
+          vil.nom_village,
+          u.username AS user_account,
+          COALESCE(c_count.nb_inscrits, 0) AS nb_inscrits,
+          COALESCE(p_sum.total_paiements, 0) AS total_paiements,
+          COALESCE(paq_sum.total_valeur_paquets, 0) AS total_valeur_paquets
+        FROM ve
+        LEFT JOIN villages vil ON ve.village_id = vil.id
+        LEFT JOIN users u ON ve.user_id = u.id
 
--- 🔹 Sous-requête pour compter les clients
-LEFT JOIN (
-  SELECT ve_id, COUNT(DISTINCT id) AS nb_inscrits
-  FROM clients
-  GROUP BY ve_id
-) AS c_count ON c_count.ve_id = ve.id
+        LEFT JOIN (
+          SELECT ve_id, COUNT(DISTINCT id) AS nb_inscrits
+          FROM clients
+          GROUP BY ve_id
+        ) AS c_count ON c_count.ve_id = ve.id
 
--- 🔹 Sous-requête pour la somme des paiements
-LEFT JOIN (
-  SELECT c.ve_id, SUM(p.montant) AS total_paiements
-  FROM paiements p
-  JOIN clients c ON p.client_id = c.id
-  GROUP BY c.ve_id
-) AS p_sum ON p_sum.ve_id = ve.id
+        LEFT JOIN (
+          SELECT c.ve_id, SUM(p.montant) AS total_paiements
+          FROM paiements p
+          JOIN clients c ON p.client_id = c.id
+          GROUP BY c.ve_id
+        ) AS p_sum ON p_sum.ve_id = ve.id
 
--- 🔹 Sous-requête pour la valeur totale des paquets
-LEFT JOIN (
-  SELECT ve_id, SUM(paq.prix_fcfa) AS total_valeur_paquets
-  FROM clients c
-  JOIN paquets paq ON c.paquet_id = paq.id
-  GROUP BY ve_id
-) AS paq_sum ON paq_sum.ve_id = ve.id
+        LEFT JOIN (
+          SELECT c.ve_id, SUM(paq.prix_fcfa) AS total_valeur_paquets
+          FROM clients c
+          JOIN paquets paq ON c.paquet_id = paq.id
+          GROUP BY c.ve_id
+        ) AS paq_sum ON paq_sum.ve_id = ve.id
 
-ORDER BY ve.nom;
-
+        ORDER BY ve.nom;
       `);
     } else if (["USER", "VE"].includes(req.user.role)) {
       result = await db.query(
@@ -275,7 +348,8 @@ ORDER BY ve.nom;
   }
 });
 
-// === VE DETAILS ===
+// ==================== VE DETAILS ====================
+
 app.get("/ve/:id", authenticateToken, async (req, res) => {
   const requestedId = parseInt(req.params.id);
   const user = req.user;
@@ -300,126 +374,118 @@ app.get("/ve/:id", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Erreur serveur" });
   }
 });
-// === AJOUTER UN CLIENT ===
+
+// ==================== AJOUTER UN CLIENT ====================
+
 app.post("/clients", authenticateToken, async (req, res) => {
-  const client = await db.connect();
-  try {
-    const { ve_id, nom, prenom, telephone, montant, numero_recu, paquet_id } = req.body;
+  return withIdempotency(req, res, "POST:/clients", async () => {
+    const pgClient = await db.connect();
 
-    if (!ve_id || !nom || !prenom || !telephone)
-      return res.status(400).json({ message: "Champs manquants" });
+    try {
+      const { ve_id, nom, prenom, telephone, montant, numero_recu, paquet_id } = req.body;
 
-    // Vérification VE
-    if (req.user.role !== "ADMIN") {
-      const checkVe = await client.query(
-        "SELECT id FROM ve WHERE user_id = $1",
-        [req.user.id]
-      );
-      if (checkVe.rows.length === 0 || checkVe.rows[0].id !== Number(ve_id))
-        return res.status(403).json({ message: "Accès interdit" });
-    }
+      if (!ve_id || !nom || !prenom || !telephone)
+        return res.status(400).json({ message: "Champs manquants" });
 
-    // Village du VE
-    const veRes = await client.query(
-      "SELECT village_id FROM ve WHERE id = $1",
-      [ve_id]
-    );
-    if (veRes.rows.length === 0)
-      return res.status(400).json({ message: "VE introuvable" });
-
-    const village_id = veRes.rows[0].village_id;
-
-    await client.query("BEGIN");
-
-    // 🔒 1. Vérification doublon CLIENT
-    const clientCheck = await client.query(
-      `
-      SELECT id FROM clients
-      WHERE nom = $1
-        AND prenom = $2
-        AND telephone = $3
-        AND village_id = $4
-      LIMIT 1
-      `,
-      [nom, prenom, telephone, village_id]
-    );
-
-    if (clientCheck.rows.length > 0) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({
-        message: "Ce client existe déjà dans ce village."
-      });
-    }
-
-    // 🔒 2. Vérification reçu AVANT insertion
-    if (montant && Number(montant) > 0) {
-      if (!numero_recu || numero_recu.trim() === "") {
-        await client.query("ROLLBACK");
-        return res.status(400).json({
-          message: "Le numéro de reçu est obligatoire."
-        });
+      // Vérification VE
+      if (req.user.role !== "ADMIN") {
+        const checkVe = await pgClient.query("SELECT id FROM ve WHERE user_id = $1", [
+          req.user.id,
+        ]);
+        if (checkVe.rows.length === 0 || checkVe.rows[0].id !== Number(ve_id))
+          return res.status(403).json({ message: "Accès interdit" });
       }
 
-      const recuCheck = await client.query(
-        "SELECT id FROM paiements WHERE numero_recu = $1",
-        [numero_recu.trim()]
-      );
+      // Village du VE
+      const veRes = await pgClient.query("SELECT village_id FROM ve WHERE id = $1", [ve_id]);
+      if (veRes.rows.length === 0)
+        return res.status(400).json({ message: "VE introuvable" });
 
-      if (recuCheck.rows.length > 0) {
-        await client.query("ROLLBACK");
-        return res.status(409).json({
-          message: "Ce numéro de reçu existe déjà."
-        });
-      }
-    }
+      const village_id = veRes.rows[0].village_id;
 
-    // ✅ 3. Insertion client
-    const client_code = `CL-${ve_id}-${Date.now()}`;
-    const insertClient = await client.query(
-      `
-      INSERT INTO clients
-      (client_code, nom, prenom, ve_id, village_id, date_inscription, telephone, paquet_id)
-      VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7)
-      RETURNING id
-      `,
-      [client_code, nom, prenom, ve_id, village_id, telephone, paquet_id || null]
-    );
+      await pgClient.query("BEGIN");
 
-    const client_id = insertClient.rows[0].id;
-
-    // 💰 4. Paiement initial
-    if (montant && Number(montant) > 0) {
-      await client.query(
+      // 1) Doublon client
+      const clientCheck = await pgClient.query(
         `
-        INSERT INTO paiements
-        (client_id, montant, date_paiement, user_id, numero_recu)
-        VALUES ($1,$2,NOW(),$3,$4)
+        SELECT id FROM clients
+        WHERE nom = $1 AND prenom = $2 AND telephone = $3 AND village_id = $4
+        LIMIT 1
         `,
-        [client_id, montant, req.user.id, numero_recu.trim()]
+        [nom, prenom, telephone, village_id]
       );
+
+      if (clientCheck.rows.length > 0) {
+        await pgClient.query("ROLLBACK");
+        return res.status(409).json({ message: "Ce client existe déjà dans ce village." });
+      }
+
+      // 2) Paiement initial (optionnel) : reçu obligatoire + max 2 fois
+      if (montant && Number(montant) > 0) {
+        if (!numero_recu || numero_recu.trim() === "") {
+          await pgClient.query("ROLLBACK");
+          return res.status(400).json({ message: "Le numéro de reçu est obligatoire." });
+        }
+
+        const recuCount = await pgClient.query(
+          "SELECT COUNT(*)::int AS cnt FROM paiements WHERE numero_recu = $1 AND montant = $2",
+          [numero_recu.trim(), montant]
+        );
+
+        if (recuCount.rows[0].cnt >= 2) {
+          await pgClient.query("ROLLBACK");
+          return res.status(400).json({
+            message: "Ce reçu a déjà été utilisé 2 fois pour ce montant (limite atteinte).",
+          });
+        }
+      }
+
+      // 3) Insert client
+      const client_code = `CL-${ve_id}-${Date.now()}`;
+      const insertClient = await pgClient.query(
+        `
+        INSERT INTO clients
+        (client_code, nom, prenom, ve_id, village_id, date_inscription, telephone, paquet_id)
+        VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7)
+        RETURNING id
+        `,
+        [client_code, nom, prenom, ve_id, village_id, telephone, paquet_id || null]
+      );
+
+      const client_id = insertClient.rows[0].id;
+
+      // 4) Paiement initial
+      if (montant && Number(montant) > 0) {
+        await pgClient.query(
+          `
+          INSERT INTO paiements (client_id, montant, date_paiement, user_id, numero_recu)
+          VALUES ($1,$2,NOW(),$3,$4)
+          `,
+          [client_id, montant, req.user.id, numero_recu.trim()]
+        );
+      }
+
+      await pgClient.query("COMMIT");
+      return res.json({ message: "Client créé avec succès", client_id });
+    } catch (err) {
+      try {
+        await pgClient.query("ROLLBACK");
+      } catch {}
+      console.error("Erreur POST /clients:", err);
+      return res.status(500).json({ message: "Erreur serveur" });
+    } finally {
+      pgClient.release();
     }
-
-    await client.query("COMMIT");
-
-    res.json({ message: "Client créé avec succès", client_id });
-
-  } catch (err) {
-    await client.query("ROLLBACK");
-    console.error("Erreur POST /clients:", err);
-    res.status(500).json({ message: "Erreur serveur" });
-  } finally {
-    client.release();
-  }
+  });
 });
 
+// ==================== CLIENTS D’UN VE OU D’UN VILLAGE ====================
 
-// === CLIENTS D’UN VE OU D’UN VILLAGE ===
 app.get("/clients/ve/:ve_id", authenticateToken, async (req, res) => {
   const { ve_id } = req.params;
   try {
     let result;
 
-    // ADMIN → voit tous les clients du VE
     if (req.user.role === "ADMIN") {
       result = await db.query(
         `
@@ -436,14 +502,11 @@ app.get("/clients/ve/:ve_id", authenticateToken, async (req, res) => {
         LEFT JOIN paiements pai ON c.id = pai.client_id
         LEFT JOIN paquets paq ON c.paquet_id = paq.id
         WHERE c.ve_id = $1
-        GROUP BY 
-          c.id, v.nom_village, paq.culture, paq.superficie, paq.prix_fcfa, paq.composition
+        GROUP BY c.id, v.nom_village, paq.culture, paq.superficie, paq.prix_fcfa, paq.composition
         ORDER BY c.date_inscription DESC
         `,
         [ve_id]
       );
-
-    // VE → ne voit que ses clients de son propre village
     } else if (req.user.role === "VE") {
       result = await db.query(
         `
@@ -460,8 +523,7 @@ app.get("/clients/ve/:ve_id", authenticateToken, async (req, res) => {
         LEFT JOIN paiements pai ON c.id = pai.client_id
         LEFT JOIN paquets paq ON c.paquet_id = paq.id
         WHERE c.village_id = $1
-        GROUP BY 
-          c.id, v.nom_village, paq.culture, paq.superficie, paq.prix_fcfa, paq.composition
+        GROUP BY c.id, v.nom_village, paq.culture, paq.superficie, paq.prix_fcfa, paq.composition
         ORDER BY c.date_inscription DESC
         `,
         [req.user.village_id]
@@ -477,11 +539,11 @@ app.get("/clients/ve/:ve_id", authenticateToken, async (req, res) => {
   }
 });
 
-// === HISTORIQUE DES PAIEMENTS D’UN CLIENT ===
+// ==================== HISTORIQUE DES PAIEMENTS D’UN CLIENT ====================
+
 app.get("/paiements/client/:client_id", authenticateToken, async (req, res) => {
   const { client_id } = req.params;
   try {
-    // Vérification des droits
     if (req.user.role !== "ADMIN") {
       const check = await db.query(
         `SELECT c.id
@@ -517,7 +579,9 @@ app.get("/paiements/client/:client_id", authenticateToken, async (req, res) => {
     res.status(500).json({ message: "Erreur serveur" });
   }
 });
-// === CLIENT DETAILS ===
+
+// ==================== CLIENT DETAILS ====================
+
 app.get("/clients/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
   try {
@@ -552,102 +616,65 @@ app.get("/clients/:id", authenticateToken, async (req, res) => {
   }
 });
 
-// === AJOUTER UN PAIEMENT ===
+// ==================== AJOUTER UN PAIEMENT ====================
+
 app.post("/paiements", authenticateToken, async (req, res) => {
-  const { client_id, montant, password, numero_recu } = req.body;
+  return withIdempotency(req, res, "POST:/paiements", async () => {
+    const { client_id, montant, password, numero_recu } = req.body;
 
-  try {
-    if (!numero_recu || numero_recu.trim() === "")
-      return res.status(400).json({ message: "Le numéro de reçu est obligatoire." });
+    try {
+      if (!numero_recu || numero_recu.trim() === "")
+        return res.status(400).json({ message: "Le numéro de reçu est obligatoire." });
 
-    const userRes = await db.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
-    if (userRes.rows.length === 0)
-      return res.status(400).json({ message: "Utilisateur introuvable" });
+      const userRes = await db.query("SELECT * FROM users WHERE id = $1", [req.user.id]);
+      if (userRes.rows.length === 0)
+        return res.status(400).json({ message: "Utilisateur introuvable" });
 
-    const user = userRes.rows[0];
-    const match = await bcrypt.compare(password, user.password_hash);
-    if (!match) return res.status(400).json({ message: "Mot de passe incorrect" });
+      const user = userRes.rows[0];
+      const match = await bcrypt.compare(password, user.password_hash);
+      if (!match) return res.status(400).json({ message: "Mot de passe incorrect" });
 
-    // Vérification VE
-    if (req.user.role === "VE") {
-      const check = await db.query(
-        `SELECT c.id
-         FROM clients c
-         JOIN ve ON c.ve_id = ve.id
-         WHERE c.id = $1 AND ve.user_id = $2`,
-        [client_id, req.user.id]
+      // Vérification VE
+      if (req.user.role === "VE") {
+        const check = await db.query(
+          `SELECT c.id
+           FROM clients c
+           JOIN ve ON c.ve_id = ve.id
+           WHERE c.id = $1 AND ve.user_id = $2`,
+          [client_id, req.user.id]
+        );
+        if (check.rows.length === 0)
+          return res.status(403).json({ message: "Accès interdit" });
+      }
+
+      // ✅ Reçu + même montant autorisé 2 fois max
+      const recuCount = await db.query(
+        "SELECT COUNT(*)::int AS cnt FROM paiements WHERE numero_recu = $1 AND montant = $2",
+        [numero_recu.trim(), montant]
       );
-      if (check.rows.length === 0)
-        return res.status(403).json({ message: "Accès interdit" });
+
+      if (recuCount.rows[0].cnt >= 2) {
+        return res.status(400).json({
+          message: "Ce reçu a déjà été utilisé 2 fois pour ce montant (limite atteinte).",
+        });
+      }
+
+      await db.query(
+        `INSERT INTO paiements (client_id, montant, date_paiement, user_id, numero_recu)
+         VALUES ($1, $2, NOW(), $3, $4)`,
+        [client_id, montant, req.user.id, numero_recu.trim()]
+      );
+
+      return res.json({ message: "Paiement enregistré avec succès", numero_recu: numero_recu.trim() });
+    } catch (error) {
+      console.error(error);
+      return res.status(500).json({ message: "Erreur serveur" });
     }
-
-   // Vérifier si le reçu existe déjà avec le même montant
-const recuCheck = await db.query(
-  "SELECT id FROM paiements WHERE numero_recu = $1 AND montant = $2",
-  [numero_recu, montant]
-);
-
-if (recuCheck.rows.length > 0) {
-  return res.status(400).json({
-    message: "Ce numéro de reçu existe déjà pour ce montant.",
   });
-}
-
-    // Enregistrer le paiement
-    await db.query(
-      `INSERT INTO paiements (client_id, montant, date_paiement, user_id, numero_recu)
-       VALUES ($1, $2, NOW(), $3, $4)`,
-      [client_id, montant, req.user.id, numero_recu]
-    );
-
-    res.json({ message: "Paiement enregistré avec succès", numero_recu });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Erreur serveur" });
-  }
-});
-// === HISTORIQUE DES PAIEMENTS D’UN CLIENT
-app.get("/paiements/client/:client_id", authenticateToken, async (req, res) => {
-  const { client_id } = req.params;
-  try {
-    // Vérification des droits
-    if (req.user.role !== "ADMIN") {
-      const check = await db.query(
-        `SELECT c.id
-         FROM clients c
-         JOIN ve ON c.ve_id = ve.id
-         WHERE c.id = $1 AND ve.user_id = $2`,
-        [client_id, req.user.id]
-      );
-      if (check.rows.length === 0)
-        return res.status(403).json({ message: "Accès interdit" });
-    }
-
-    const result = await db.query(
-      `
-      SELECT 
-        p.id AS paiement_id,
-        p.numero_recu,
-        p.montant,
-        p.date_paiement,
-        u.username AS payeur_username
-      FROM paiements p
-      JOIN clients c ON p.client_id = c.id
-      LEFT JOIN users u ON p.user_id = u.id
-      WHERE p.client_id = $1
-      ORDER BY p.date_paiement DESC
-      `,
-      [client_id]
-    );
-
-    res.json(result.rows);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ message: "Erreur serveur" });
-  }
 });
 
-// === GET TOUS LES PAQUETS ===
+// ==================== GET TOUS LES PAQUETS ====================
+
 app.get("/paquets", authenticateToken, async (req, res) => {
   try {
     const result = await db.query("SELECT * FROM paquets ORDER BY culture, superficie");
@@ -658,10 +685,14 @@ app.get("/paquets", authenticateToken, async (req, res) => {
   }
 });
 
-// === ROUTE DE TEST / ===
+// ==================== ROUTE DE TEST / ====================
+
 app.get("/", (req, res) => {
   res.send("✅ API Senedjiguiya en ligne !");
 });
-// === START ===
+
+// ==================== START ====================
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => console.log(`🚀 Serveur lancé sur le port ${PORT}`));
+
